@@ -1,0 +1,149 @@
+public class AppointmentTriggerHandler {
+    
+    public static void handleAfterInsert(List<Appointment__c> newList){
+        Event event = new Event();
+        List<Event> lstEvents = new List<Event>();
+        List<Appointment__c> lstAppointments = [SELECT ID, Patient__c, Physician__c, Patient__r.Name, Physician__r.Name, Appointment_Date__c, 
+                                                Physician__r.Start_Time__c, Physician__r.End_Time__c 
+                                                FROM Appointment__c WHERE Id IN : newList];
+        Map<Id, DateTime> mapOfPhysicianVsAppointment = new Map<Id, DateTime>();
+        Map<Id, Account> mapOfPhysicianRecords = new Map<Id, Account>([SELECT id, name, Start_Time__c, End_Time__c, Specialization__c from Account where Appointment_Price__c > 0]);
+        Appointment__c objAppointment = newList[0];
+        Boolean clashingEvent = false;
+        String validationMessage;
+        
+        for(Appointment__c obj : lstAppointments){
+            Time appointmentTime = obj.Appointment_Date__c.Time();
+            if(appointmentTime < obj.Physician__r.Start_Time__c || appointmentTime > obj.Physician__r.End_Time__c){
+                clashingEvent = true;
+                validationMessage = 'Dr. ' + obj.Physician__r.Name + ' will not be available at this time. Please provide appointment based on availability.';
+            }else{
+                event.WhoId = obj.Patient__c;
+                event.WhatId = obj.Physician__c;
+                event.Subject = 'Appointment';
+                event.description = obj.Patient__r.Name + ' Consulting with ' + obj.Physician__r.Name;
+                event.IsAllDayEvent = false;
+                event.StartDateTime = obj.Appointment_Date__c;
+                event.EndDateTime = obj.Appointment_Date__c.addMinutes(30);
+                mapOfPhysicianVsAppointment.put(obj.Physician__c, obj.Appointment_Date__c);
+                lstEvents.add(event);    
+            }
+        }
+        List<Event> lstExistingEvents = [select Id, WhoId, WhatId, Subject, StartDateTime, EndDateTime, Account.Name, Who.Name FROM Event WHERE WhatId IN : mapOfPhysicianVsAppointment.keySet()];
+		
+        for(Event obj : lstExistingEvents){
+            system.debug('###'+mapOfPhysicianVsAppointment.get(obj.WhatId) + DateTime.now());
+            
+            if(mapOfPhysicianVsAppointment.get(obj.WhatId) < DateTime.now()){
+                clashingEvent = true;
+                validationMessage = 'You cannot schedule an appointment for past days';
+            }
+            if(obj.StartDateTime == mapOfPhysicianVsAppointment.get(obj.WhatId) || (obj.StartDateTime < mapOfPhysicianVsAppointment.get(obj.WhatId) && obj.EndDateTime > mapOfPhysicianVsAppointment.get(obj.WhatId))){
+            	clashingEvent = true;
+                validationMessage = 'Dr. ' + obj.Account.Name + ' will be busy at this time due to the appointment with ' + obj.Who.Name;
+            }	        	    	
+        }
+        
+        if(clashingEvent == true){
+            newList[0].addError(validationMessage);
+        }else{
+            if(lstEvents.size() > 0){
+                insert lstEvents;
+            }    
+        }        
+        
+        Account objAccount = [SELECT ID, EMAIL__c, Name FROM ACCOUNT WHERE ID =: objAppointment.Physician__c LIMIT 1];
+        doCreateNewCalendarEvent(objAppointment.Id);
+        Contact objContact = [SELECT ID, Name, EMAIL FROM Contact WHERE ID =: objAppointment.Patient__c LIMIT 1];
+        if(!String.isBlank(objContact.Email)){
+            doSendInviteToPatient(objAccount, objContact, objAppointment);            
+        }
+    }
+    
+        
+    @future (callout=true)
+    public static void doCreateNewCalendarEvent(Id appointmentId){
+        Appointment__c objAppointment = [SELECT Id, Physician__r.Email__c, Patient__r.Name, Appointment_Date__c FROM  Appointment__c WHERE Id =: appointmentId LIMIT 1];
+        List<GoogleCalenderInfo__c> googleSettingInfoList = new List<GoogleCalenderInfo__c>();
+        googleSettingInfoList = GoogleCalenderInfo__c.getAll().values();
+        String accessToken = googleSettingInfoList[0].Access_Token__c;
+        system.debug('###'+objAppointment.Appointment_Date__c);
+        String eventStartDate = String.valueof(String.valueof(objAppointment.Appointment_Date__c).left(10)+'T'+String.valueof(objAppointment.Appointment_Date__c).substringAfter(' ')+'+05:30');
+        String eventEndDate = String.valueof(String.valueof(objAppointment.Appointment_Date__c).left(10)+'T'+String.valueof(objAppointment.Appointment_Date__c.addMinutes(30)).substringAfter(' ')+'+05:30');
+        String createEventEndPoint = 'https://www.googleapis.com/calendar/v3/calendars/'+ Label.organizerEmail +'/events';
+        system.debug('###'+eventStartDate);
+        system.debug('###'+eventEndDate);
+        String createEventBody = '{' +
+            '"attendees": ['+
+            '{'+
+            '"email":"' + objAppointment.Physician__r.Email__c + '"'+
+            '}'+
+            '],'+
+            '"attachments": ['+
+            '{'+
+            '"fileUrl": ""'+
+            '}'+
+            '],'+
+            '"end": {'+
+            '"dateTime": "' + eventEndDate +'"'+
+            '},'+
+            '"reminders": {'+
+            '"useDefault": true'+
+            '},'+
+            '"start": {'+
+            '"dateTime": "' + eventStartDate +'"'+
+            '},'+
+            '"summary": "Appointment of ' + objAppointment.Patient__r.Name + '",'+
+            '"location": "ABC Clinic for Health Checkup"'+
+            '}';
+        System.debug('#### createEventBody '+createEventBody );
+        Http http = new Http();
+        HttpRequest httpReq = new HttpRequest();
+        HttpResponse HttpRes = new HttpResponse();
+        
+        httpReq.setEndpoint(createEventEndPoint);
+        httpReq.setMethod('POST');
+        httpReq.setBody(createEventBody );
+        httpReq.setHeader('Content-Type', 'application/json');
+        httpReq.setHeader('Authorization','Bearer '+accessToken);
+        try{
+            HttpRes = http.send(httpReq);
+            if(HttpRes.getStatusCode() == 200){
+                /*ApexPages.addmessage(new ApexPages.message(
+                    ApexPages.severity.CONFIRM,'Calendar Event Successfully '+'\n'+' '+
+                    HttpRes.getBody()));*/
+                system.debug('Calendar Event Successfully');
+            }else{
+                /*String errorMessage = 'Unexpected Error while communicating with Google Calendar API. '
+                    +'Status '+HttpRes.getStatus()+' and Status Code '+HttpRes.getStatuscode();
+                ApexPages.addmessage(new ApexPages.message(ApexPages.severity.ERROR,errorMessage));*/
+                system.debug('Unexpected Error while communicating with Google Calendar API.');
+            }
+        }catch(System.Exception e){
+            System.debug('#### Exception Executed : '+e.getMessage() + ' '+e.getStackTraceString() + ' '+e.getLineNumber());
+        }
+    }
+    
+    public static void doSendInviteToPatient(Account objAccount, Contact objContact, Appointment__c objAppointment){
+        Messaging.SingleEmailMessage message = new        Messaging.SingleEmailMessage();
+        message.setTargetObjectId(objContact.id); 
+        message.setSenderDisplayName('ABC Healthcare'); 
+        message.setReplyTo('no-reply@abchealthcare.com');
+        message.setUseSignature(false); 
+        message.setBccSender(false); 
+        message.setSaveAsActivity(false); 
+        EmailTemplate emailTemplate = [Select Id,Subject,Description,HtmlValue,DeveloperName,Body from EmailTemplate where name = 'ABC Healthcare'];
+        message.setTemplateID(emailTemplate.Id); 
+        message.setWhatId(objAppointment.Id); //This is important for the merge fields in template to work
+        message.toAddresses = new String[] { objContact.email};
+            Messaging.SingleEmailMessage[] messages = new List<Messaging.SingleEmailMessage> {message};
+                Messaging.SendEmailResult[] results = Messaging.sendEmail(messages);
+        
+        if (results[0].success) 
+        {
+            System.debug('The email was sent successfully.');
+        } else {
+            System.debug('The email failed to send: ' +  results[0].errors[0].message);
+        }
+    }
+}
