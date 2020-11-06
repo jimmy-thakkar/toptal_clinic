@@ -1,0 +1,5 @@
+trigger AppointmentTrigger on Appointment__c (After Insert) {
+    if(Trigger.isAfter && Trigger.isInsert){
+        AppointmentTriggerHandler.handleAfterInsert(Trigger.new);
+    }
+}
